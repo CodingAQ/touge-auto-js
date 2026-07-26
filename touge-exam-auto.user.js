@@ -17,6 +17,7 @@
 // @connect      api.anthropic.com
 // @connect      dashscope.aliyuncs.com
 // @connect      ark.cn-beijing.volces.com
+// @connect      *
 // @run-at       document-end
 // ==/UserScript==
 
