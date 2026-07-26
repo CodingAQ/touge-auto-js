@@ -1,4 +1,4 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         头歌考试自动答题
 // @namespace    https://github.com/CodingAQ/touge-exam-auto
 // @version      2.0.0
@@ -7,7 +7,6 @@
 // @license      MIT
 // @match        *://tg.zcst.edu.cn/classrooms/*/exercise/*
 // @match        *://*.educoder.net/classrooms/*/exercise/*
-// @icon         https://icons.png
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -18,7 +17,6 @@
 // @connect      api.anthropic.com
 // @connect      dashscope.aliyuncs.com
 // @connect      ark.cn-beijing.volces.com
-// @connect      *
 // @run-at       document-end
 // ==/UserScript==
 
@@ -104,7 +102,7 @@
         apiKey: '',
         model: 'gpt-4o-mini',
         autoNext: true,
-        nextDelay: 600,
+        nextDelay: 2000,
         programFillAuto: true,  // 程序填空题是否自动填入
         skipImage: false        // 题目含图片则跳过
     };
@@ -140,7 +138,7 @@
             if (!config.model || config.model.trim().length === 0) errors.push('模型名称不能为空');
             return { isValid: errors.length === 0, errors };
         },
-        reset() { this.save(DEFAULT_CONFIG); return DEFAULT_CONFIG; }
+        reset() { const freshCopy = { ...DEFAULT_CONFIG }; this.save(freshCopy); return freshCopy; }
     };
 
     let currentConfig = Config.load();
@@ -217,10 +215,14 @@
             if (objMatch) { try { const obj = JSON.parse(objMatch[0]); if (obj.answer !== undefined) return obj.answer; } catch (e) {} }
             const arrMatch = text.match(/\[[\s\S]*\]/);
             if (arrMatch) { try { const arr = JSON.parse(arrMatch[0]); if (Array.isArray(arr)) return arr; } catch (e) {} }
-            const letterMatch = text.match(/\b([A-E])\b/);
-            if (letterMatch) return letterMatch[1];
+            const letterMatch = text.match(/\b([A-H])\b/);
+            if (letterMatch) {
+                const letter = letterMatch[1];
+                // Simple heuristic: if the text contains option patterns, use the letter
+                return letter;
+            }
+            if (/不对|不正确|错误|错|否|False|false|F|×/.test(text)) return 'B';
             if (/正确|对|是|True|true|T|√/.test(text)) return 'A';
-            if (/错误|错|否|False|false|F|×/.test(text)) return 'B';
             return text.trim();
         }
     };
@@ -340,20 +342,35 @@
 
     // 可靠填入 React/Ant Design 受控 input 的值
     async function fillInputValue(element, value) {
-        if (!element) return;
+        if (!element) return false;
         element.scrollIntoView({ block: 'center' });
         element.focus();
         element.click();
         element.dispatchEvent(new Event('focus', { bubbles: true }));
         await sleep(300);
         element.select();
+        const oldValue = element.value;
         try { document.execCommand('insertText', false, value); } catch (e) { /* 忽略 */ }
-        element.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: value }));
-        element.dispatchEvent(new Event('change', { bubbles: true }));
-        await sleep(200);
-        element.blur();
-        element.dispatchEvent(new Event('blur', { bubbles: true }));
-        await sleep(300);
+        await sleep(100);
+        if (element.value !== value) {
+            // Fallback: use native value setter
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            if (nativeInputValueSetter) {
+                nativeInputValueSetter.call(element, value);
+            } else {
+                element.value = value;
+            }
+        }
+        if (element.value === value) {
+            element.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: value }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+            await sleep(200);
+            element.blur();
+            element.dispatchEvent(new Event('blur', { bubbles: true }));
+            await sleep(300);
+            return true;
+        }
+        return false;
     }
 
     // 关闭"运行结果"弹窗（真实鼠标操作）
@@ -362,13 +379,32 @@
         const closeSelectors = [
             '.ant-modal-close', '.ant-modal-close-x', '.ant-drawer-close',
             'button[aria-label="Close"]', 'button[aria-label="close"]',
-            '[class*="close"]', '.anticon-close',
+            '.anticon-close',
+            '[class*="close"]'
         ];
         let closeBtn = null;
+        let modalRoot = null;
         for (let w = 0; w < 30 && !closeBtn; w++) {
-            for (const sel of closeSelectors) {
-                const btn = document.querySelector(sel);
-                if (btn && btn.offsetParent !== null) { closeBtn = btn; break; }
+            // Try to find the modal/drawer root
+            const modals = document.querySelectorAll('.ant-modal, .ant-drawer');
+            for (const modal of modals) {
+                if (modal.offsetParent !== null) {
+                    modalRoot = modal;
+                    break;
+                }
+            }
+            if (modalRoot) {
+                for (const sel of closeSelectors) {
+                    const btn = modalRoot.querySelector(sel);
+                    if (btn && btn.offsetParent !== null) { closeBtn = btn; break; }
+                }
+            }
+            if (!closeBtn) {
+                // Fallback to global search
+                for (const sel of closeSelectors) {
+                    const btn = document.querySelector(sel);
+                    if (btn && btn.offsetParent !== null) { closeBtn = btn; break; }
+                }
             }
             if (!closeBtn) await sleep(500);
         }
@@ -418,13 +454,25 @@
             if (Array.isArray(answer)) fillAnswers = answer.map(a => String(a).trim());
             else if (typeof answer === 'string') fillAnswers = answer.split(/[;；]/).map(a => a.trim()).filter(a => a);
             if (fillAnswers.length === 0) { console.warn('[填入] 填空答案为空'); return false; }
+            // Check if we have answers for all required blanks
+            if (fillAnswers.length < fillInputs.length) {
+                console.warn('[填入] 答案数量不足: ' + fillAnswers.length + ' < ' + fillInputs.length);
+            }
             console.log('[填入] 将填入', Math.min(fillInputs.length, fillAnswers.length), '个空, 值:', fillAnswers);
             let success = true;
             for (let i = 0; i < fillInputs.length && i < fillAnswers.length; i++) {
                 console.log('[填入] 填入' + fillInputs[i].label + ': ' + fillAnswers[i] + ' | input:', fillInputs[i].element.outerHTML.substring(0, 100));
-                await fillInputValue(fillInputs[i].element, fillAnswers[i]);
+                const fillSuccess = await fillInputValue(fillInputs[i].element, fillAnswers[i]);
                 console.log('[填入] 填入后' + fillInputs[i].label + ' value=' + fillInputs[i].element.value);
+                if (!fillSuccess || fillInputs[i].element.value !== fillAnswers[i]) {
+                    console.warn('[填入] 填入失败或验证不通过: ' + fillInputs[i].label);
+                    success = false;
+                }
                 await sleep(3000);
+            }
+            // If answers are missing for required blanks, mark as unsuccessful
+            if (fillAnswers.length < fillInputs.length) {
+                success = false;
             }
             // 程序填空题额外点击"提交代码"按钮
             if (question.type === 'program_fill' && !opts.skipSubmit) {
@@ -434,7 +482,10 @@
                 for (const b of allBtns) {
                     if (b.textContent.includes('提交代码')) { submitBtn = b; break; }
                 }
-                if (submitBtn) {
+                if (!submitBtn) {
+                    console.warn('[填入] 未找到"提交代码"按钮');
+                    success = false;
+                } else {
                     submitBtn.click();
                     console.log('[填入] 已点击提交代码');
                     // 等待"运行结果"弹窗出现，用真实鼠标操作关闭
@@ -450,7 +501,16 @@
 
         let candidates = [];
         if (Array.isArray(answer)) candidates = answer.map(a => String(a).trim().toUpperCase()).filter(a => /^[A-H]$/.test(a));
-        else if (typeof answer === 'string') candidates = answer.replace(/[^A-Ha-h]/g,'').toUpperCase().split('');
+        else if (typeof answer === 'string') {
+            // Extract only standalone option letters (not embedded in words)
+            const matches = answer.match(/\b[A-Ha-h]\b/g);
+            if (matches) {
+                candidates = matches.map(m => m.toUpperCase());
+            } else {
+                // Fallback: extract all letters but this is less reliable
+                candidates = answer.replace(/[^A-Ha-h]/g,'').toUpperCase().split('');
+            }
+        }
 
         if (candidates.length === 0) { console.warn('[填入] 无效答案:', answer); return false; }
 
@@ -492,8 +552,12 @@
 
     function clearQuestion(question) {
         if (!question?.element) return;
-        question.element.querySelectorAll('input[type="radio"]').forEach(e => e.checked = false);
-        question.element.querySelectorAll('input[type="checkbox"]').forEach(e => e.checked = false);
+        question.element.querySelectorAll('input[type="radio"]').forEach(e => {
+            if (e.checked) e.click();
+        });
+        question.element.querySelectorAll('input[type="checkbox"]').forEach(e => {
+            if (e.checked) e.click();
+        });
     }
 
     // ==================== 导航 ====================
@@ -508,7 +572,7 @@
     function clickNextQuestion() {
         const buttons = document.querySelectorAll(SELECTORS.CHANGE_BTN);
         for (const btn of buttons) {
-            if (btn.textContent.includes('下一题')) { btn.click(); console.log('[导航] 点击下一题'); return true; }
+            if (btn.textContent.includes('下一题') && btn.offsetParent !== null) { btn.click(); console.log('[导航] 点击下一题'); return true; }
         }
         return false;
     }
@@ -516,7 +580,7 @@
     function clickPrevQuestion() {
         const buttons = document.querySelectorAll(SELECTORS.CHANGE_BTN);
         for (const btn of buttons) {
-            if (btn.textContent.includes('上一题')) { btn.click(); return true; }
+            if (btn.textContent.includes('上一题') && btn.offsetParent !== null) { btn.click(); return true; }
         }
         return false;
     }
@@ -610,7 +674,7 @@
         autoRunning = true;
         updateSmartBtnState(true);
         answerHistory = [];
-        let successCount = 0, failCount = 0;
+        let successCount = 0, failCount = 0, skipCount = 0;
 
         while (autoRunning) {
             // ① 提取当前可见题目
@@ -621,8 +685,8 @@
             // 开关：题目含图片则跳过
             if (currentConfig.skipImage && question.hasImage) {
                 console.log('[答题] 题目含图片，已跳过');
-                successCount++;
-                const answeredTotal = successCount + failCount;
+                skipCount++;
+                const answeredTotal = successCount + failCount + skipCount;
                 appendLog('【#' + answeredTotal + (getCurrentQuestionNumber() > 0 ? ' 题号' + getCurrentQuestionNumber() : '') + '】[图片] 已跳过');
                 updateProgress(answeredTotal);
                 await sleep(currentConfig.nextDelay || 2000);
@@ -671,7 +735,7 @@
             } else { failCount++; }
 
             // 追加日志
-            const answeredTotal = successCount + failCount;
+            const answeredTotal = successCount + failCount + skipCount;
             let typeTag = '[单选]';
             if (question.type === 'multiple') typeTag = '[多选]';
             else if (question.type === 'judgement') typeTag = '[判断]';
@@ -686,24 +750,44 @@
             // 答完等待 1000-1200ms
             await sleep(1000 + Math.random() * 200);
 
-            // ④ 检查「下一题」
+            // ④ 检查「下一题」及自动翻题开关
             if (!hasNextButton()) { console.log('[答题] 没有下一题，完成'); break; }
+            if (!currentConfig.autoNext) { console.log('[答题] 自动翻题已关闭，停止'); break; }
 
-            // ⑤ 翻题（先释放焦点，避免填空输入框劫持事件）
+            // ⑤ 翻题前记录当前题目标识
+            const beforeNavText = question.text.substring(0, 50);
+            const beforeNavNum = qNum;
+
+            // ⑥ 翻题（先释放焦点，避免填空输入框劫持事件）
             updateStatusText('翻到下一题...');
             if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
-            clickNextQuestion();
+            const navSuccess = clickNextQuestion();
+            if (!navSuccess) {
+                console.log('[答题] 点击下一题失败，停止');
+                break;
+            }
             await sleep(700);
+
+            // ⑦ 验证题目是否真的改变了
+            const afterQuestion = extractCurrentQuestion();
+            if (afterQuestion) {
+                const afterNavText = afterQuestion.text.substring(0, 50);
+                const afterNavNum = getCurrentQuestionNumber();
+                if (afterNavText === beforeNavText && afterNavNum === beforeNavNum) {
+                    console.log('[答题] 题目未改变，停止以避免重复处理');
+                    break;
+                }
+            }
         }
 
         autoRunning = false;
         updateSmartBtnState(false);
-        const answeredTotal = successCount + failCount;
-        updateStatusText('完成！' + successCount + '题成功, ' + failCount + '题失败');
+        const answeredTotal = successCount + failCount + skipCount;
+        updateStatusText('完成！' + successCount + '题成功, ' + failCount + '题失败' + (skipCount > 0 ? ', ' + skipCount + '题跳过' : ''));
         updateProgress(answeredTotal);
-        appendLog('── 答题结束：成功 ' + successCount + '，失败 ' + failCount + ' ──');
+        appendLog('── 答题结束：成功 ' + successCount + '，失败 ' + failCount + (skipCount > 0 ? '，跳过 ' + skipCount : '') + ' ──');
         showToast('自动答题完成 (' + successCount + '/' + answeredTotal + ')');
-        console.log('[答题] 完成:', successCount, '成功,', failCount, '失败');
+        console.log('[答题] 完成:', successCount, '成功,', failCount, '失败,', skipCount, '跳过');
     }
 
     // ==================== UI ====================
@@ -733,7 +817,9 @@
                 row.addEventListener('click', function(e) {
                     e.stopPropagation();
                     const raw = this.getAttribute('data-copy');
-                    navigator.clipboard.writeText(raw).then(() => showToast('已复制', 1500));
+                    navigator.clipboard.writeText(raw)
+                        .then(() => showToast('已复制', 1500))
+                        .catch(() => showToast('复制失败', 1500));
                 });
             });
         } else {
@@ -910,7 +996,7 @@
         saveBtn.addEventListener('click', () => {
             currentConfig.apiProvider = provF.select.value; currentConfig.apiUrl = urlF.input.value.trim();
             currentConfig.apiKey = keyF.input.value.trim(); currentConfig.model = modelF.input.value.trim();
-            currentConfig.nextDelay = parseInt(delayF.select.value, 10) || 600;
+            currentConfig.nextDelay = parseInt(delayF.select.value, 10) || 2000;
             if (!Config.validate(currentConfig).isValid) { showToast(Config.validate(currentConfig).errors[0]); return; }
             Config.save(currentConfig); showToast('设置已保存');
             settingsOpen = false; setPanel.style.display = 'none'; settingsBtn.style.color = '#888';
